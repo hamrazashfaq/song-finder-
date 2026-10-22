@@ -1,4 +1,3 @@
-# song-finder-
 # 🎵 Song Finder
 
 Type a few lines of lyrics (any language or script, even Roman Urdu / Hindi) and get the
@@ -55,8 +54,10 @@ song-finder/
 5. Click **Deploy**. You get a public URL like `https://your-app.streamlit.app`.
 
 ## Notes
-- Default model is `gemini-2.5-flash`. You can change the model name in the sidebar
-  (for example if Google releases a newer Flash model).
+- Default model is `gemini-3.8-flash`. Google retires older models over time
+  (`gemini-2.5-flash` now returns 404 for new users). If you ever see a 404 NOT_FOUND
+  error, change the model name in the sidebar to a current Flash model listed at
+  https://ai.google.dev/gemini-api/docs/models
 - AI can be wrong. Always check the confidence level and the sources.
 - The app does not display or store song lyrics.
 
