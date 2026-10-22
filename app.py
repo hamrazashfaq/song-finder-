@@ -11,7 +11,7 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 
 # Fields we ask Gemini to return, with the label shown in the UI.
 FIELDS = [
@@ -200,7 +200,15 @@ def main() -> None:
                 except ValueError as e:
                     st.error(str(e))
                 except Exception as e:  # network, quota, invalid key...
-                    st.error(f"Gemini request failed: {e}")
+                    msg = str(e)
+                    if "NOT_FOUND" in msg or "404" in msg:
+                        st.error(
+                            "This Gemini model is not available. Change the model name "
+                            "in the sidebar (see ai.google.dev/gemini-api/docs/models).\n\n"
+                            f"Details: {msg}"
+                        )
+                    else:
+                        st.error(f"Gemini request failed: {msg}")
                 else:
                     render_result(data, sources)
 
