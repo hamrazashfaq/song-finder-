@@ -1,4 +1,4 @@
-"""Song Finder - identify a song from a few lyrics (any language) using Gemini + Google Search.
+"""Song Finder - identify a song from a few lyrics (any language) using Google Gemini.
 
 Run locally:  streamlit run app.py
 """
@@ -12,6 +12,9 @@ from google import genai
 from google.genai import types
 
 DEFAULT_MODEL = "gemini-3.8-flash"
+# Tried automatically (in order) if the chosen model is out of quota or unavailable.
+# Each model has its own quota, so this often rescues a "429" error.
+FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
 
 # Fields we ask Gemini to return, with the label shown in the UI.
 FIELDS = [
@@ -32,15 +35,24 @@ FIELDS = [
 # ----------------------------------------------------------------------------
 # Helper functions (kept separate from the UI so they are easy to test)
 # ----------------------------------------------------------------------------
-def build_prompt(lyrics: str) -> str:
+def build_prompt(lyrics: str, grounded: bool = False) -> str:
     """Create the instruction we send to Gemini."""
+    if grounded:
+        method = (
+            "Use Google Search to find which song these lyrics come from, then "
+            "report verified details."
+        )
+    else:
+        method = (
+            "Identify which song these lyrics come from using your own knowledge "
+            "(you have no internet access)."
+        )
     return f"""You are a music expert. A user typed a fragment of song lyrics.
 The lyrics may be in ANY language or script (English, Urdu, Hindi, Pashto,
 Arabic, Spanish, Korean, ...), may be transliterated (Roman Urdu etc.), and may
 contain small mistakes.
 
-Use Google Search to find which song these lyrics come from, then report
-verified details. Do NOT guess: if you are not sure, say so in "confidence"
+{method} Do NOT guess: if you are not sure, say so in "confidence"
 and use "Unknown" for missing fields. Never invent names or dates.
 Do NOT quote the song's lyrics in your answer.
 
@@ -96,19 +108,52 @@ def get_sources(response) -> list[tuple[str, str]]:
     return sources
 
 
-def identify_song(api_key: str, model: str, lyrics: str):
-    """Call Gemini (with Google Search grounding). Returns (data_dict, sources)."""
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=build_prompt(lyrics),
-        config=types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            temperature=0.1,  # low = fewer made-up facts
-        ),
+def is_retryable(error: Exception) -> bool:
+    """True for quota / model-unavailable / temporary errors worth trying another way."""
+    msg = str(error)
+    return any(
+        code in msg
+        for code in ("429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND", "503", "UNAVAILABLE")
     )
-    data = extract_json(response.text)
-    return data, get_sources(response)
+
+
+def identify_song(api_key: str, model: str, lyrics: str, use_search: bool = False):
+    """Ask Gemini to identify the song.
+
+    Tries the chosen model first, then the fallback models. If ``use_search`` is on,
+    each model is tried WITH Google Search first and then WITHOUT it (Google Search
+    grounding is not available on the free tier and causes 429 errors there).
+
+    Returns (data_dict, sources, info) where info = {"model": ..., "grounded": ...}.
+    """
+    client = genai.Client(api_key=api_key)
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_error = None
+
+    for name in models:
+        for grounded in ([True, False] if use_search else [False]):
+            config = (
+                types.GenerateContentConfig(
+                    tools=[types.Tool(google_search=types.GoogleSearch())]
+                )
+                if grounded
+                else None
+            )
+            try:
+                response = client.models.generate_content(
+                    model=name,
+                    contents=build_prompt(lyrics, grounded),
+                    config=config,
+                )
+            except Exception as e:
+                if is_retryable(e):
+                    last_error = e
+                    continue  # try next option
+                raise  # e.g. invalid API key: no point retrying
+            data = extract_json(response.text)
+            return data, get_sources(response), {"model": name, "grounded": grounded}
+
+    raise last_error if last_error else RuntimeError("No model could be used.")
 
 
 def get_api_key() -> str:
@@ -121,10 +166,29 @@ def get_api_key() -> str:
     return os.environ.get("GEMINI_API_KEY", "")
 
 
+def friendly_error(error: Exception) -> str:
+    """Turn a raw API error into a short, helpful message."""
+    msg = str(error)
+    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+        return (
+            "Gemini quota exceeded for every model I tried. The free tier allows only a "
+            "few requests per minute and per day. Wait a minute and try again, or check "
+            "your usage at https://ai.dev/rate-limit (or enable billing for higher limits)."
+        )
+    if "404" in msg or "NOT_FOUND" in msg:
+        return (
+            "No Gemini model was available. Type a current model name in the sidebar "
+            "(see https://ai.google.dev/gemini-api/docs/models)."
+        )
+    if "API_KEY_INVALID" in msg or "API key not valid" in msg or "401" in msg or "403" in msg:
+        return "Your Gemini API key looks invalid or not allowed. Please check it."
+    return f"Gemini request failed: {msg}"
+
+
 # ----------------------------------------------------------------------------
 # Streamlit UI
 # ----------------------------------------------------------------------------
-def render_result(data: dict, sources: list[tuple[str, str]]) -> None:
+def render_result(data: dict, sources: list[tuple[str, str]], info: dict) -> None:
     if not data.get("found", True):
         st.warning("Could not identify this song.")
         st.write(data.get("summary", "Try adding more lyrics or fixing spelling."))
@@ -133,7 +197,7 @@ def render_result(data: dict, sources: list[tuple[str, str]]) -> None:
     confidence = str(data.get("confidence", "unknown")).lower()
     badge = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(confidence, "⚪")
     st.subheader(f"🎵 {data.get('title', 'Unknown')}")
-    st.caption(f"{badge} Confidence: {confidence}")
+    st.caption(f"{badge} Confidence: {confidence}  ·  Model: {info['model']}")
 
     col1, col2 = st.columns(2)
     for i, (key, label) in enumerate(FIELDS):
@@ -157,6 +221,11 @@ def render_result(data: dict, sources: list[tuple[str, str]]) -> None:
         with st.expander("Sources (Google Search)"):
             for title, url in sources:
                 st.markdown(f"- [{title}]({url})")
+    elif not info["grounded"]:
+        st.caption(
+            "ℹ️ Answered from the model's own knowledge (no web search). "
+            "Double-check names and dates for lesser-known songs."
+        )
 
     st.download_button(
         "Download details (JSON)",
@@ -177,6 +246,12 @@ def main() -> None:
             "Gemini API key", type="password", help="Get one at aistudio.google.com"
         )
         model = st.text_input("Gemini model", value=DEFAULT_MODEL)
+        use_search = st.checkbox(
+            "Use Google Search (paid plan only)",
+            value=False,
+            help="More accurate and shows sources, but Google does not include Search "
+            "grounding in the free tier. If it fails, the app falls back automatically.",
+        )
         st.caption("Your key is only used for this session.")
 
     lyrics = st.text_area(
@@ -194,27 +269,21 @@ def main() -> None:
         else:
             with st.spinner("Searching..."):
                 try:
-                    data, sources = identify_song(api_key, model.strip(), lyrics)
+                    data, sources, info = identify_song(
+                        api_key, model.strip() or DEFAULT_MODEL, lyrics, use_search
+                    )
                 except json.JSONDecodeError:
                     st.error("Model returned malformed data. Please try again.")
                 except ValueError as e:
                     st.error(str(e))
                 except Exception as e:  # network, quota, invalid key...
-                    msg = str(e)
-                    if "NOT_FOUND" in msg or "404" in msg:
-                        st.error(
-                            "This Gemini model is not available. Change the model name "
-                            "in the sidebar (see ai.google.dev/gemini-api/docs/models).\n\n"
-                            f"Details: {msg}"
-                        )
-                    else:
-                        st.error(f"Gemini request failed: {msg}")
+                    st.error(friendly_error(e))
                 else:
-                    render_result(data, sources)
+                    render_result(data, sources, info)
 
     st.divider()
     st.caption(
-        "AI can make mistakes. Check the sources and confidence level before relying on the result."
+        "AI can make mistakes. Check the confidence level and verify important details."
     )
 
 
